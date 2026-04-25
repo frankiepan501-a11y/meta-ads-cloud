@@ -353,12 +353,13 @@ def import_docx_to_wiki(docx_path, title):
     log(f'  DOCX size: {len(docx_bytes)} bytes')
 
     doc_token = None
-    for attempt in range(2):
+    for attempt in range(4):
         doc_token = _upload_and_import_docx(docx_bytes, title)
         if doc_token:
             break
-        log(f'  Import attempt {attempt+1}/2 failed, retrying...')
-        time.sleep(5)
+        wait = 5 * (attempt + 1)
+        log(f'  Import attempt {attempt+1}/4 failed, waiting {wait}s...')
+        time.sleep(wait)
     if not doc_token:
         return None, None
 
