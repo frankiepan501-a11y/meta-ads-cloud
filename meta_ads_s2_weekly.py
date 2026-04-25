@@ -163,6 +163,153 @@ def download_image(url):
 # ============================================================
 # Build .docx report with embedded images → import to Feishu
 # ============================================================
+def build_md_report(all_reports, week_str, now):
+    """Build a markdown report — used on cloud (SKIP_ADLIB_IMAGES=1) for reliable Feishu import."""
+    date_str = now.strftime('%Y-%m-%d')
+    lines = []
+    lines.append(f'# ({date_str})竞品META广告分析')
+    lines.append(f'\n生成时间: {now.strftime("%Y-%m-%d %H:%M")} | 周次: {week_str}')
+
+    lines.append('\n## 本周总览')
+    for rpt in all_reports:
+        lines.append(
+            f'- {rpt["name"]} — 活跃:{rpt["ads_count"]} | 新增:{rpt["new_count"]}'
+            f' | 停投:{rpt["stopped_count"]} | 威胁:{rpt["threat"]}')
+
+    for rpt in all_reports:
+        lines.append(f'\n## {rpt["name"]}（威胁：{rpt["threat"]}）')
+        lines.append(
+            f'**活跃广告: {rpt["ads_count"]}** | 新增: {rpt["new_count"]}'
+            f' | 停投: {rpt["stopped_count"]} | 持续: {rpt["continuing_count"]}')
+        lines.append('\n### 广告拆解')
+        for i, ad in enumerate(rpt['ads'][:10]):
+            analysis = rpt['per_ad'][i] if i < len(rpt['per_ad']) else {}
+            ad_id = ad.get('id', '')
+            is_new = ad_id in rpt['new_ids']
+            tag = ' [新]' if is_new else ''
+            lines.append(f'\n#### 广告 #{i+1}{tag} — {ad.get("pageName", "")}')
+            if ad_id:
+                lines.append(f'Ad Library: https://www.facebook.com/ads/library/?id={ad_id}')
+            body_text = ad.get('body', '')[:300].replace('\n', ' ')
+            if body_text:
+                lines.append(f'**Ad Copy:** {body_text}')
+            cta = ad.get('cta', '')
+            if cta:
+                lines.append(f'**CTA:** {cta}')
+            for label, field in [('停(Hook)', 'stop'), ('病(Pain)', 'pain'),
+                                 ('药(Solution)', 'medicine'), ('信(Trust)', 'trust'),
+                                 ('买(CTA)', 'buy')]:
+                val = analysis.get(field, '')
+                if val:
+                    lines.append(f'- **{label}:** {val}')
+            rating = analysis.get('rating', '')
+            if rating:
+                lines.append(f'评分: {rating}')
+            borrow = analysis.get('borrow', '')
+            if borrow:
+                lines.append(f'- 💡 **借鉴:** {borrow}')
+            improve = analysis.get('improve', '')
+            if improve:
+                lines.append(f'- 🔧 **改进:** {improve}')
+        for key, title in [('整体策略', '策略洞察'), ('周变化点评', '本周变化'),
+                           ('威胁评估', '威胁评估'), ('行动建议', '行动建议')]:
+            content = (rpt['overall'].get(key, '') or '').strip()
+            if not content:
+                continue
+            lines.append(f'\n### {title}')
+            for line in content.split('\n')[:20]:
+                t = line.strip()
+                if not t:
+                    continue
+                clean = re.sub(r'^[\d\.\)、\-*•]+\s*', '', t)
+                lines.append(f'- {clean}')
+
+    lines.append('\n## 汇总行动项')
+    for rpt in all_reports:
+        actions = (rpt['overall'].get('行动建议', '') or '').strip()
+        if not actions:
+            continue
+        lines.append(f'\n### {rpt["name"]}')
+        for line in actions.split('\n')[:8]:
+            t = line.strip()
+            if not t:
+                continue
+            clean = re.sub(r'^[\d\.\)、\-*•]+\s*', '', t)
+            if clean:
+                lines.append(f'- ☐ {clean}')
+
+    return '\n'.join(lines)
+
+
+def import_md_to_wiki(md_content, title):
+    """Upload markdown → import as Feishu docx → move to wiki. Returns (wiki_url, doc_token)."""
+    md_bytes = md_content.encode('utf-8')
+    token = get_token(IM_APP_ID, IM_APP_SECRET)
+    boundary = uuid.uuid4().hex
+    extra = json.dumps({'obj_type': 'docx', 'file_extension': 'md'})
+    parts = []
+    for n, v in [('file_name', f'{title}.md'), ('parent_type', 'ccm_import_open'),
+                 ('size', str(len(md_bytes))), ('extra', extra)]:
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{n}"\r\n\r\n{v}\r\n'.encode())
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{title}.md"\r\n'
+                 f'Content-Type: text/markdown\r\n\r\n'.encode())
+    parts.append(md_bytes)
+    parts.append(f'\r\n--{boundary}--\r\n'.encode())
+
+    req = urllib.request.Request('https://open.feishu.cn/open-apis/drive/v1/medias/upload_all',
+        data=b''.join(parts),
+        headers={'Content-Type': f'multipart/form-data; boundary={boundary}',
+                 'Authorization': f'Bearer {token}'})
+    try:
+        resp = json.loads(urllib.request.build_opener(PROXY).open(req, timeout=60).read())
+        file_token = resp['data']['file_token']
+    except Exception as e:
+        log(f'  MD upload failed: {e}')
+        return None, None
+
+    r = feishu('POST', '/drive/v1/import_tasks', {
+        'file_extension': 'md', 'file_token': file_token,
+        'type': 'docx', 'point': {'mount_type': 1, 'mount_key': ''},
+    }, app='im')
+    if r.get('code') != 0:
+        log(f'  MD import task failed: {r}')
+        return None, None
+    ticket = r['data']['ticket']
+    doc_token = None
+    for _ in range(60):
+        time.sleep(2)
+        r2 = feishu('GET', f'/drive/v1/import_tasks/{ticket}', app='im')
+        st = r2.get('data', {}).get('result', {}).get('job_status', -1)
+        if st == 0:
+            doc_token = r2['data']['result'].get('token', '')
+            break
+        if st in (1, 2):
+            log(f'  MD import failed: status={st}')
+            return None, None
+    if not doc_token:
+        return None, None
+
+    feishu('POST', f'/drive/v1/permissions/{doc_token}/members?type=docx&need_notification=false',
+           {'member_type': 'openid', 'member_id': BOSS_OPEN_ID, 'perm': 'full_access'}, app='im')
+
+    r3 = feishu('POST', f'/wiki/v2/spaces/{WIKI_SPACE_ID}/nodes/move_docs_to_wiki', {
+        'parent_wiki_token': WIKI_PARENT_NODE,
+        'obj_type': 'docx', 'obj_token': doc_token,
+    }, app='im')
+    if r3.get('code') != 0:
+        return f'https://u1wpma3xuhr.feishu.cn/docx/{doc_token}', doc_token
+    node_token = r3.get('data', {}).get('wiki_token')
+    if not node_token:
+        for _ in range(10):
+            time.sleep(2)
+            rn = feishu('GET', f'/wiki/v2/spaces/get_node?obj_type=docx&token={doc_token}', app='im')
+            node_token = rn.get('data', {}).get('node', {}).get('node_token')
+            if node_token:
+                break
+    return (f'https://u1wpma3xuhr.feishu.cn/wiki/{node_token}' if node_token
+            else f'https://u1wpma3xuhr.feishu.cn/docx/{doc_token}'), doc_token
+
+
 def build_docx_report(all_reports, week_str, now):
     """Build a .docx file with embedded ad images. Returns file path."""
     from docx import Document
@@ -736,16 +883,21 @@ def main():
         log('No reports to generate.')
         return
 
-    log('\nStep 5: Building .docx report with embedded images...')
-    docx_path = build_docx_report(all_reports, week_str, now)
-    log(f'  DOCX: {os.path.getsize(docx_path)} bytes')
-
     date_str = now.strftime('%Y-%m-%d')
-    wiki_url, doc_token = import_docx_to_wiki(docx_path, f'({date_str})竞品META广告分析')
-    try:
-        os.remove(docx_path)
-    except OSError:
-        pass
+    if SKIP_ADLIB_IMAGES:
+        log('\nStep 5: Building markdown report (cloud v1, no images)...')
+        md = build_md_report(all_reports, week_str, now)
+        log(f'  MD: {len(md.encode("utf-8"))} bytes')
+        wiki_url, doc_token = import_md_to_wiki(md, f'({date_str})竞品META广告分析')
+    else:
+        log('\nStep 5: Building .docx report with embedded images...')
+        docx_path = build_docx_report(all_reports, week_str, now)
+        log(f'  DOCX: {os.path.getsize(docx_path)} bytes')
+        wiki_url, doc_token = import_docx_to_wiki(docx_path, f'({date_str})竞品META广告分析')
+        try:
+            os.remove(docx_path)
+        except OSError:
+            pass
     if not wiki_url:
         log('  Failed to create report doc!')
         return
