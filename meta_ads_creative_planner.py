@@ -80,7 +80,7 @@ def generate_plan(product, features, s2_insights):
 {chr(10).join(s2_insights[:3])}
 
 ===== 任务 =====
-请生成 **6 个创意角度**，每个角度同时包含图片版和视频版方案。
+请生成 **12 个创意角度**（参 Meta SMB 实验：3-10 creatives 比 1 个 CPA 低 46% / 99.99% 置信度，Andromeda 时代官方推荐 10-20 个独特创意/campaign），每个角度同时包含图片版和视频版方案。
 
 严格按以下JSON格式输出（只输出JSON，不要其他文字）：
 
@@ -90,7 +90,8 @@ def generate_plan(product, features, s2_insights):
     "angle_name": "角度名称",
     "target_audience": "目标受众",
     "funnel_level": "TOFU/MOFU/BOFU",
-    "strategy_reason": "为什么这个角度有效（参考竞品哪些策略）",
+    "visual_type": "UGC/产品Demo/客户证言/创作者合拍/Lifestyle场景/对比测试/开箱/教学讲解",
+    "strategy_reason": "为什么这个角度有效（参考竞品哪些策略）+ 跟其他 11 个角度的视觉/文案/格式三维差异点",
 
     "s3_image": {{
       "scene_style": "电竞桌面/简约白底/礼品场景/生活方式/户外运动/自定义",
@@ -118,12 +119,13 @@ def generate_plan(product, features, s2_insights):
 ]
 ```
 
-要求：
-1. 6个角度覆盖不同痛点/情绪/场景
-2. 至少2个TOFU、2个MOFU、2个BOFU
-3. 图片版和视频版的创意角度一致，但表现形式不同
-4. 至少3个图片带文案+CTA，3个纯产品图
-5. 参考竞品有效策略做差异化"""
+强制要求（按 Meta 官方 Creative Diversification + Andromeda 创意分组机制）：
+1. **12 个角度，每层至少 4 个**：TOFU 4+ / MOFU 4+ / BOFU 4+
+2. **三维必须差异化**（视觉 + 营销文案 + 格式），不要同视觉风格只换文字 — 算法会合并成"同一创意"，学习不重启
+3. `visual_type` 字段在 12 个角度里**至少覆盖 6 种不同类型**（UGC / 产品Demo / 客户证言 / 创作者合拍 / Lifestyle场景 / 对比测试 / 开箱 / 教学讲解）
+4. 图片+视频成对（同一 angle_name 下 s3_image 和 s4_video 都要有），让算法在同一 Ad Set 自动分配预算
+5. 至少 6 个图片带文案+CTA，6 个纯产品图（覆盖完整漏斗）
+6. 参考竞品有效策略做差异化，**禁止**抄袭原文案"""
 
     result = deepseek(system_prompt, prompt)
 

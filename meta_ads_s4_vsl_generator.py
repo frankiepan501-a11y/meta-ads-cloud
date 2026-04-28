@@ -1,6 +1,6 @@
 """S4 VSL Script Generator — 视频广告脚本生成器.
 Input: product name + key features
-Process: pull S1/S2/素材库 context → DeepSeek generates 5-8 angle VSL scripts
+Process: pull S1/S2/素材库 context → DeepSeek generates 12 angle VSL scripts (Meta Creative Diversification)
 Output: python-docx → import to Feishu wiki → notify
 """
 import json, urllib.request, sys, time, re, datetime, uuid, os, io
@@ -492,7 +492,7 @@ def main(product=None, features=None):
 
 ===== 任务要求 =====
 
-请为产品【{product}】生成 **6个不同角度** 的短视频广告脚本。
+请为产品【{product}】生成 **12 个不同角度** 的短视频广告脚本（参 Meta SMB 实验：3-10 creatives 比 1 个 CPA 低 46%；Andromeda 时代官方推荐 10-20 个独特创意/campaign）。
 
 每个角度的脚本格式：
 
@@ -531,13 +531,15 @@ def main(product=None, features=None):
 
 ---
 
-要求：
-1. 6个角度必须切入不同的痛点/情绪/场景，不要重复
-2. 至少使用3种不同的结构公式（从12种中选择最合适的）
-3. 口播文案全部用英文（美区市场），画面描述用中文
-4. 参考竞品的有效策略，但要做出差异化
-5. 每条脚本必须覆盖至少2层漏斗，其中至少2条要覆盖全部3层（TOFU+MOFU+BOFU）
-6. 结合素材库已有的痛点和评论，但也要提出新角度
+要求（按 Meta 官方 Creative Diversification + Andromeda 创意分组机制）：
+1. **12 个角度，每层至少 4 个**：TOFU 4+ / MOFU 4+ / BOFU 4+
+2. **三维必须差异化**（视觉风格 + 营销文案口吻 + 视频结构公式），不要同视觉风格只换文字 — 算法会合并成"同一创意"，学习不重启
+3. 至少使用 **6 种不同的结构公式**（从 12 种中选）
+4. 至少使用 **6 种不同的视觉类型**：UGC / 产品Demo / 客户证言 / 创作者合拍 / Lifestyle场景 / 对比测试 / 开箱 / 教学讲解
+5. 口播文案全部用英文（美区市场），画面描述用中文
+6. 参考竞品的有效策略，但要做出差异化（**禁止**抄袭原文案）
+7. 每条脚本必须覆盖至少 2 层漏斗，**其中至少 6 条覆盖全部 3 层**（TOFU+MOFU+BOFU）
+8. 结合素材库已有的痛点和评论，但也要提出新角度
 '''
 
     try:
