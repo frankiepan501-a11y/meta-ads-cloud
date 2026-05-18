@@ -339,6 +339,207 @@ def wow(curr, prev):
 # ============================================================
 # Build .docx report
 # ============================================================
+def compute_diversity(all_top_ads):
+    """Creative Diversity Health Check per Meta 官方 (knowledge.md 八/九/十一).
+    Group active creatives by account+campaign; rate breadth(格式) + depth(数量).
+    SMB 实验: 3-10 creatives 比 1 个 CPA -46%; Andromeda 推荐 12+ 独特创意.
+    """
+    from collections import defaultdict
+    groups = defaultdict(lambda: {'video': 0, 'image': 0})
+    for ad in all_top_ads:
+        key = (ad.get('account', ''), ad.get('campaign', '') or '(未命名Campaign)')
+        ct = ad.get('creative_type', 'image')
+        groups[key][ct] = groups[key].get(ct, 0) + 1
+    rows = []
+    for (acct, camp), g in groups.items():
+        v, im = g.get('video', 0), g.get('image', 0)
+        total = v + im
+        mixed = v > 0 and im > 0
+        if total < 3:
+            rating = '🔴 Poor'
+            advice = f'仅 {total} 个活跃创意，低于 Meta 官方 3-10 下限，立即补到 12+'
+        elif total < 12 and not mixed:
+            only = '视频' if v > 0 else '图片'
+            need = '图片' if v > 0 else '视频'
+            rating = '🟠 Average'
+            advice = f'{total} 个全是{only}，缺{need}格式；补{need}并扩到 12+'
+        elif total < 12 and mixed:
+            rating = '🟡 Good'
+            advice = f'{total} 个混合创意已达标，未到 Andromeda 推荐 12+，建议继续扩充'
+        elif total >= 12 and not mixed:
+            only = '视频' if v > 0 else '图片'
+            need = '图片' if v > 0 else '视频'
+            rating = '🟠 Average'
+            advice = f'{total} 个但全是{only}，补{need}格式提升 breadth'
+        else:
+            rating = '🟢 Excellent'
+            advice = '创意数 + 格式分布均达标'
+        rows.append({'account': acct, 'campaign': camp, 'total': total,
+                     'video': v, 'image': im, 'rating': rating, 'advice': advice})
+    rows.sort(key=lambda r: r['total'])
+    return rows
+
+
+def import_md_to_wiki(md_content, title):
+    """Upload markdown → import as Feishu docx → move to wiki. Returns (wiki_url, doc_token).
+    Markdown import is reliable on cloud (docx import systematically gets status=2)."""
+    md_bytes = md_content.encode('utf-8')
+
+    def _attempt():
+        token = get_token(IM_APP_ID, IM_APP_SECRET)
+        boundary = uuid.uuid4().hex
+        extra = json.dumps({'obj_type': 'docx', 'file_extension': 'md'})
+        parts = []
+        for n, v in [('file_name', f'{title}.md'), ('parent_type', 'ccm_import_open'),
+                     ('size', str(len(md_bytes))), ('extra', extra)]:
+            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{n}"\r\n\r\n{v}\r\n'.encode())
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{title}.md"\r\n'
+                     f'Content-Type: text/markdown\r\n\r\n'.encode())
+        parts.append(md_bytes)
+        parts.append(f'\r\n--{boundary}--\r\n'.encode())
+        req = urllib.request.Request('https://open.feishu.cn/open-apis/drive/v1/medias/upload_all',
+            data=b''.join(parts),
+            headers={'Content-Type': f'multipart/form-data; boundary={boundary}',
+                     'Authorization': f'Bearer {token}'})
+        try:
+            resp = json.loads(urllib.request.build_opener(PROXY).open(req, timeout=60).read())
+            file_token = resp['data']['file_token']
+        except Exception as e:
+            log(f'  MD upload failed: {e}')
+            return None
+        r = feishu('POST', '/drive/v1/import_tasks', {
+            'file_extension': 'md', 'file_token': file_token,
+            'type': 'docx', 'point': {'mount_type': 1, 'mount_key': ''},
+        })
+        if r.get('code') != 0:
+            log(f'  MD import task failed: {r}')
+            return None
+        ticket = r['data']['ticket']
+        for _ in range(60):
+            time.sleep(2)
+            r2 = feishu('GET', f'/drive/v1/import_tasks/{ticket}')
+            st = r2.get('data', {}).get('result', {}).get('job_status', -1)
+            if st == 0:
+                return r2['data']['result'].get('token', '')
+            if st in (1, 2):
+                log(f'  MD import failed: status={st}')
+                return None
+        return None
+
+    doc_token = None
+    for attempt in range(4):
+        doc_token = _attempt()
+        if doc_token:
+            break
+        wait = 5 * (attempt + 1)
+        log(f'  MD import attempt {attempt+1}/4 failed, waiting {wait}s...')
+        time.sleep(wait)
+    if not doc_token:
+        return None, None
+
+    feishu('POST', f'/drive/v1/permissions/{doc_token}/members?type=docx&need_notification=false',
+           {'member_type': 'openid', 'member_id': BOSS_OPEN_ID, 'perm': 'full_access'})
+    r3 = feishu('POST', f'/wiki/v2/spaces/{WIKI_SPACE_ID}/nodes/move_docs_to_wiki', {
+        'parent_wiki_token': WIKI_PARENT_NODE,
+        'obj_type': 'docx', 'obj_token': doc_token,
+    })
+    if r3.get('code') != 0:
+        return f'https://u1wpma3xuhr.feishu.cn/docx/{doc_token}', doc_token
+    node_token = r3.get('data', {}).get('wiki_token')
+    if not node_token:
+        for _ in range(10):
+            time.sleep(2)
+            rn = feishu('GET', f'/wiki/v2/spaces/get_node?obj_type=docx&token={doc_token}')
+            node_token = rn.get('data', {}).get('node', {}).get('node_token')
+            if node_token:
+                break
+    return (f'https://u1wpma3xuhr.feishu.cn/wiki/{node_token}' if node_token
+            else f'https://u1wpma3xuhr.feishu.cn/docx/{doc_token}'), doc_token
+
+
+def build_report_md(title, pk_total, pk_last_total, fl_total, fl_last_total,
+                    pk_campaigns, fl_campaigns, all_top_ads, sections, now):
+    """Markdown S1 report (cloud v1, no embedded images). Includes Creative Diversity Health Check."""
+    wow_pk_spend = wow(pk_total['spend'], pk_last_total['spend'])
+    wow_pk_roas = wow(pk_total['roas'], pk_last_total['roas'])
+    wow_fl_spend = wow(fl_total['spend'], fl_last_total['spend'])
+    wow_fl_roas = wow(fl_total['roas'], fl_last_total['roas'])
+
+    L = []
+    L.append(f'# {title}')
+    L.append(f'\n生成时间: {now.strftime("%Y-%m-%d %H:%M")}')
+    L.append('\n## 整体表现')
+    L.append(f'- **Powkong** | Spend: ${pk_total["spend"]:.2f} ({wow_pk_spend}) | '
+             f'ROAS: {pk_total["roas"]} ({wow_pk_roas}) | Purchases: {pk_total["purchases"]}')
+    L.append(f'- **Funlab** | Spend: ${fl_total["spend"]:.2f} ({wow_fl_spend}) | '
+             f'ROAS: {fl_total["roas"]} ({wow_fl_roas}) | Purchases: {fl_total["purchases"]}')
+
+    for key, t in [('整体表现总结', 'AI 分析总结'), ('Campaign排行', 'Campaign 排行'),
+                   ('问题诊断', '问题诊断')]:
+        c = sections.get(key, '').strip()
+        if not c:
+            continue
+        L.append(f'\n## {t}')
+        for line in c.split('\n')[:25]:
+            s = line.strip()
+            if s:
+                L.append(s if s.startswith(('-', '*', '•')) else f'- {s}')
+
+    # ── Creative Diversity Health Check (Meta 官方 八/九/十一) ──
+    div = compute_diversity(all_top_ads)
+    L.append('\n## 🎯 Creative Diversity 体检（Meta 官方准则）')
+    L.append('> 依据：Meta SMB 实验 3-10 creatives 比 1 个 CPA 低 46%（99.99% 置信度）；'
+             'Andromeda 时代推荐每 campaign 12+ 个独特创意；必须混合 image+video。')
+    if not div:
+        L.append('\n（本周无活跃广告数据，无法体检）')
+    else:
+        L.append('\n| 账户 | Campaign | 活跃创意 | 视频 | 图片 | 评级 | 建议 |')
+        L.append('|---|---|---|---|---|---|---|')
+        for r in div:
+            L.append(f'| {r["account"]} | {r["campaign"][:24]} | {r["total"]} | '
+                     f'{r["video"]} | {r["image"]} | {r["rating"]} | {r["advice"]} |')
+        poor = [r for r in div if 'Poor' in r['rating'] or 'Average' in r['rating']]
+        if poor:
+            L.append(f'\n⚠️ **{len(poor)} 个 Campaign 创意多样性不达标**，'
+                     f'是当前最高优先级——按 Meta 官方，多样性不足直接拉高 CPA。')
+
+    winning = sections.get('Winning Ads素材分析', '').strip()
+    if winning:
+        L.append('\n## Winning Ads 素材分析')
+        for line in winning.split('\n')[:40]:
+            s = line.strip()
+            if s:
+                L.append(s if s.startswith(('-', '*', '•', '#')) else f'- {s}')
+
+    L.append('\n## Top 广告明细')
+    L.append('\n| # | 广告 | 账户 | ROAS | Spend | 购买 | CPC | CTR | 类型 |')
+    L.append('|---|---|---|---|---|---|---|---|---|')
+    for i, ad in enumerate(all_top_ads[:10]):
+        L.append(f'| {i+1} | {ad["ad_name"][:30]} | {ad["account"]} | {ad["roas"]} | '
+                 f'${ad["spend"]} | {ad["purchases"]} | ${ad["cpc"]} | {ad["ctr"]}% | '
+                 f'{"🎬" if ad["creative_type"]=="video" else "🖼️"} |')
+
+    for key, t in [('本周假设验证', '本周假设验证'), ('下周内容制作指引', '下周内容制作指引')]:
+        c = sections.get(key, '').strip()
+        if not c:
+            continue
+        L.append(f'\n## {t}')
+        for line in c.split('\n')[:20]:
+            s = line.strip()
+            if s:
+                L.append(s if s.startswith(('-', '*', '•')) else f'- {s}')
+
+    actions = sections.get('下周行动项', '').strip()
+    if actions:
+        L.append('\n## 下周行动项')
+        for line in actions.split('\n')[:10]:
+            s = re.sub(r'^[\d\.\)、\-*•\[\]\s]+', '', line.strip())
+            if s:
+                L.append(f'- ☐ {s}')
+
+    return '\n'.join(L)
+
+
 def build_report_docx(title, pk_total, pk_last_total, fl_total, fl_last_total,
                       pk_campaigns, fl_campaigns, all_top_ads, sections,
                       ad_library_ads, now):
@@ -492,6 +693,17 @@ def build_report_docx(title, pk_total, pk_last_total, fl_total, fl_last_total,
                 doc.add_paragraph(re.sub(r'^\d+[\.\)、]\s*', '', t), style='List Number')
             else:
                 doc.add_paragraph(t)
+
+    # ── Creative Diversity Health Check (Meta 官方 八/九/十一) ──
+    div = compute_diversity(all_top_ads)
+    doc.add_heading('🎯 Creative Diversity 体检（Meta 官方准则）', level=2)
+    doc.add_paragraph('依据：Meta SMB 实验 3-10 creatives 比 1 个 CPA 低 46%（99.99% 置信度）；'
+                      'Andromeda 推荐每 campaign 12+ 独特创意；必须混合 image+video。')
+    for r in div:
+        p = doc.add_paragraph(style='List Bullet')
+        p.add_run(f'[{r["account"]}] {r["campaign"][:24]} — ').bold = True
+        p.add_run(f'活跃 {r["total"]}（视频{r["video"]}/图片{r["image"]}）| '
+                  f'{r["rating"]} | {r["advice"]}')
 
     # ── Action items ──
     actions = sections.get('下周行动项', '').strip()
@@ -670,21 +882,28 @@ Funlab: Spend ${fl_total["spend"]:.2f} ({wow_fl_spend}) | ROAS {fl_total["roas"]
         sections[k] = sections[k].strip()
     log(f'  Sections: {list(sections.keys())}')
 
-    # ── Step 5: Build .docx ───────────────────────────────────
-    log('Step 5: Building .docx with embedded images...')
+    # ── Step 5+6: Build report + import ───────────────────────
     report_title = f'({date_str})META广告周报'
-    docx_path = build_report_docx(
-        report_title, pk_total, pk_last_total, fl_total, fl_last_total,
-        pk_campaigns, fl_campaigns, all_top_ads, sections, ad_library_ads, now)
-    log(f'  DOCX: {os.path.getsize(docx_path)} bytes')
-
-    # ── Step 6: Import to Feishu wiki ─────────────────────────
-    log('Step 6: Importing to Feishu wiki...')
-    wiki_url, doc_token = import_docx_to_wiki(docx_path, report_title)
-    try:
-        os.remove(docx_path)
-    except OSError:
-        pass
+    if SKIP_ADLIB_IMAGES:
+        log('Step 5: Building markdown report (cloud v1, no images)...')
+        md = build_report_md(report_title, pk_total, pk_last_total, fl_total,
+                             fl_last_total, pk_campaigns, fl_campaigns,
+                             all_top_ads, sections, now)
+        log(f'  MD: {len(md.encode("utf-8"))} bytes')
+        log('Step 6: Importing markdown to Feishu wiki...')
+        wiki_url, doc_token = import_md_to_wiki(md, report_title)
+    else:
+        log('Step 5: Building .docx with embedded images...')
+        docx_path = build_report_docx(
+            report_title, pk_total, pk_last_total, fl_total, fl_last_total,
+            pk_campaigns, fl_campaigns, all_top_ads, sections, ad_library_ads, now)
+        log(f'  DOCX: {os.path.getsize(docx_path)} bytes')
+        log('Step 6: Importing to Feishu wiki...')
+        wiki_url, doc_token = import_docx_to_wiki(docx_path, report_title)
+        try:
+            os.remove(docx_path)
+        except OSError:
+            pass
     if not wiki_url:
         log('  Failed to create report!')
         return
