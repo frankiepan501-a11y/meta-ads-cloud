@@ -380,6 +380,89 @@ def import_docx_to_wiki(docx_path, title):
 
     return f'https://u1wpma3xuhr.feishu.cn/wiki/{node_token}', doc_token
 
+def build_vsl_md(title, product, features, scripts_text, now):
+    """VSL scripts as markdown. ai_text is already markdown-ish (### 角度 / **bold** / - bullets)."""
+    return (f'# {title}\n\n'
+            f'产品: {product} | 生成时间: {now.strftime("%Y-%m-%d %H:%M")}\n\n'
+            f'核心卖点: {features}\n\n---\n\n{scripts_text.strip()}\n')
+
+
+def import_md_to_wiki(md_content, title):
+    """Upload markdown → import → move to wiki. Reliable on cloud (docx import gets status=2)."""
+    md_bytes = md_content.encode('utf-8')
+
+    def _attempt():
+        token = get_token(IM_APP_ID, IM_APP_SECRET)
+        boundary = uuid.uuid4().hex
+        extra = json.dumps({'obj_type': 'docx', 'file_extension': 'md'})
+        parts = []
+        for n, v in [('file_name', f'{title}.md'), ('parent_type', 'ccm_import_open'),
+                     ('size', str(len(md_bytes))), ('extra', extra)]:
+            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{n}"\r\n\r\n{v}\r\n'.encode())
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{title}.md"\r\n'
+                     f'Content-Type: text/markdown\r\n\r\n'.encode())
+        parts.append(md_bytes)
+        parts.append(f'\r\n--{boundary}--\r\n'.encode())
+        req = urllib.request.Request('https://open.feishu.cn/open-apis/drive/v1/medias/upload_all',
+            data=b''.join(parts),
+            headers={'Content-Type': f'multipart/form-data; boundary={boundary}',
+                     'Authorization': f'Bearer {token}'})
+        try:
+            resp = json.loads(urllib.request.build_opener(PROXY).open(req, timeout=60).read())
+            file_token = resp['data']['file_token']
+        except Exception as e:
+            log(f'  MD upload failed: {e}')
+            return None
+        r = feishu('POST', '/drive/v1/import_tasks', {
+            'file_extension': 'md', 'file_token': file_token,
+            'type': 'docx', 'point': {'mount_type': 1, 'mount_key': ''},
+        }, app='im')
+        if r.get('code') != 0:
+            log(f'  MD import task failed: {r}')
+            return None
+        ticket = r['data']['ticket']
+        for _ in range(60):
+            time.sleep(2)
+            r2 = feishu('GET', f'/drive/v1/import_tasks/{ticket}', app='im')
+            st = r2.get('data', {}).get('result', {}).get('job_status', -1)
+            if st == 0:
+                return r2['data']['result'].get('token', '')
+            if st in (1, 2):
+                log(f'  MD import failed: status={st}')
+                return None
+        return None
+
+    doc_token = None
+    for attempt in range(4):
+        doc_token = _attempt()
+        if doc_token:
+            break
+        wait = 5 * (attempt + 1)
+        log(f'  MD import attempt {attempt+1}/4 failed, waiting {wait}s...')
+        time.sleep(wait)
+    if not doc_token:
+        return None, None
+
+    feishu('POST', f'/drive/v1/permissions/{doc_token}/members?type=docx&need_notification=false',
+           {'member_type': 'openid', 'member_id': BOSS_OPEN_ID, 'perm': 'full_access'}, app='im')
+    r3 = feishu('POST', f'/wiki/v2/spaces/{WIKI_SPACE_ID}/nodes/move_docs_to_wiki', {
+        'parent_wiki_token': WIKI_PARENT_NODE,
+        'obj_type': 'docx', 'obj_token': doc_token,
+    }, app='im')
+    if r3.get('code') != 0:
+        return f'https://u1wpma3xuhr.feishu.cn/docx/{doc_token}', doc_token
+    node_token = r3.get('data', {}).get('wiki_token')
+    if not node_token:
+        for _ in range(10):
+            time.sleep(2)
+            rn = feishu('GET', f'/wiki/v2/spaces/get_node?obj_type=docx&token={doc_token}', app='im')
+            node_token = rn.get('data', {}).get('node', {}).get('node_token')
+            if node_token:
+                break
+    return (f'https://u1wpma3xuhr.feishu.cn/wiki/{node_token}' if node_token
+            else f'https://u1wpma3xuhr.feishu.cn/docx/{doc_token}'), doc_token
+
+
 # ============================================================
 # Main
 # ============================================================
@@ -549,19 +632,17 @@ def main(product=None, features=None):
         log(f'  DeepSeek failed: {e}')
         return
 
-    # ── Step 4: Build .docx ───────────────────────────────────
-    log('Step 4: Building .docx...')
+    # ── Step 4: Build markdown report ─────────────────────────
+    # (markdown import only — cloud docx import systematically gets status=2;
+    #  S4 scripts are pure text so docx gave zero benefit anyway)
+    log('Step 4: Building markdown report...')
     report_title = f'({date_str})VSL脚本-{product}'
-    docx_path = build_vsl_docx(report_title, product, features, ai_text, now)
-    log(f'  DOCX: {os.path.getsize(docx_path)} bytes')
+    md = build_vsl_md(report_title, product, features, ai_text, now)
+    log(f'  MD: {len(md.encode("utf-8"))} bytes')
 
     # ── Step 5: Import to wiki ────────────────────────────────
-    log('Step 5: Importing to Feishu...')
-    wiki_url, doc_token = import_docx_to_wiki(docx_path, report_title)
-    try:
-        os.remove(docx_path)
-    except OSError:
-        pass
+    log('Step 5: Importing markdown to Feishu...')
+    wiki_url, doc_token = import_md_to_wiki(md, report_title)
     if not wiki_url:
         log('  Failed!')
         return
