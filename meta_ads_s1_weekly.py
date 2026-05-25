@@ -380,6 +380,44 @@ def compute_diversity(all_top_ads):
     return rows
 
 
+def compute_account_structure(all_top_ads):
+    """账户结构 & 学习期体检 (文档 SOP: 一产品线一主 Campaign / 每 Campaign 1-2 AdSet /
+    每转化 AdSet 周 ~50 事件退出学习期). 纯聚合 all_top_ads (ad 级 insights 含
+    account/campaign/adset/purchases), 无新 API. 外部方法论 + Meta 官方常识, 非铁律.
+    已知限制: ad 级 insights limit=50, 活跃 ad >50 的账户会截断 → 聚合偏低.
+    返回 (struct, learning):
+      struct   = [{account, campaigns, fragmented:[(camp, n_adset), ...]}]  按账户
+      learning = [{account, campaign, adset, purchases, spend, graduated}]  按 Ad Set 升序
+    """
+    from collections import defaultdict
+    acct_camps = defaultdict(set)       # account -> {campaign}
+    camp_adsets = defaultdict(set)      # (account, campaign) -> {adset}
+    adset_purch = defaultdict(int)      # (account, campaign, adset) -> purchases
+    adset_spend = defaultdict(float)    # (account, campaign, adset) -> spend
+    for ad in all_top_ads:
+        acct = ad.get('account', '')
+        camp = ad.get('campaign', '') or '(未命名Campaign)'
+        aset = ad.get('adset', '') or '(未命名AdSet)'
+        acct_camps[acct].add(camp)
+        camp_adsets[(acct, camp)].add(aset)
+        adset_purch[(acct, camp, aset)] += int(ad.get('purchases', 0))
+        adset_spend[(acct, camp, aset)] += float(ad.get('spend', 0))
+    struct = []
+    for acct, camps in acct_camps.items():
+        fragmented = [(c, len(camp_adsets[(acct, c)])) for c in camps
+                      if len(camp_adsets[(acct, c)]) > 2]
+        fragmented.sort(key=lambda x: -x[1])
+        struct.append({'account': acct, 'campaigns': len(camps), 'fragmented': fragmented})
+    struct.sort(key=lambda s: s['account'])
+    learning = []
+    for (acct, camp, aset), p in adset_purch.items():
+        learning.append({'account': acct, 'campaign': camp, 'adset': aset,
+                         'purchases': p, 'spend': round(adset_spend[(acct, camp, aset)], 2),
+                         'graduated': p >= 50})
+    learning.sort(key=lambda x: x['purchases'])
+    return struct, learning
+
+
 def import_md_to_wiki(md_content, title):
     """Upload markdown → import as Feishu docx → move to wiki. Returns (wiki_url, doc_token).
     Markdown import is reliable on cloud (docx import systematically gets status=2)."""
@@ -502,6 +540,33 @@ def build_report_md(title, pk_total, pk_last_total, fl_total, fl_last_total,
         if poor:
             L.append(f'\n⚠️ **{len(poor)} 个 Campaign 创意多样性不达标**，'
                      f'是当前最高优先级——按 Meta 官方，多样性不足直接拉高 CPA。')
+
+    # ── 账户结构 & 学习期体检 (文档 SOP: 结构减法 + 学习期稳定; 外部方法论非铁律) ──
+    struct, learning = compute_account_structure(all_top_ads)
+    L.append('\n## 🏗️ 账户结构 & 学习期体检')
+    L.append('> 依据：转化优化 Ad Set 每周需 ~50 优化事件才退出学习期；账户切太碎→事件分散→学不满。'
+             '（外部方法论 + Meta 官方常识，非铁律）')
+    if struct:
+        L.append('\n**账户结构**（一产品线一主 Campaign / 每 Campaign 1-2 Ad Set 为宜）')
+        L.append('\n| 账户 | Campaign 数 | 偏碎 Campaign（Ad Set >2）|')
+        L.append('|---|---|---|')
+        for s in struct:
+            frag = '；'.join(f'{c[:20]}({n}个AdSet)' for c, n in s['fragmented']) or '✅ 无'
+            L.append(f'| {s["account"]} | {s["campaigns"]} | {frag} |')
+    not_grad = [x for x in learning if not x['graduated'] and x['spend'] > 0]
+    if learning:
+        L.append('\n**学习期**（每 Ad Set 周 purchase vs 50）')
+        L.append(f'\n共 {len(learning)} 个活跃 Ad Set，其中 **{len(not_grad)} 个本周 purchase <50（学习期未毕业）**。')
+        show = sorted(not_grad, key=lambda x: -x['spend'])[:10]
+        if show:
+            L.append('\n按本周花费降序（花了钱还没毕业的最该看）：')
+            L.append('\n| 账户 | Campaign | Ad Set | 周purchase | Spend | 状态 |')
+            L.append('|---|---|---|---|---|---|')
+            for x in show:
+                L.append(f'| {x["account"]} | {x["campaign"][:18]} | {x["adset"][:18]} | '
+                         f'{x["purchases"]} | ${x["spend"]} | 🔴 未毕业 |')
+    L.append('\n**⚠️ 以下需人工核对（Graph API 拿不到）**：本周是否有预算单次调整 >20%（扩量期单日 >30%）？'
+             'Pixel/CAPI/Purchase 事件是否正常？落地页是否承接广告承诺？')
 
     winning = sections.get('Winning Ads素材分析', '').strip()
     if winning:
@@ -704,6 +769,24 @@ def build_report_docx(title, pk_total, pk_last_total, fl_total, fl_last_total,
         p.add_run(f'[{r["account"]}] {r["campaign"][:24]} — ').bold = True
         p.add_run(f'活跃 {r["total"]}（视频{r["video"]}/图片{r["image"]}）| '
                   f'{r["rating"]} | {r["advice"]}')
+
+    # ── 账户结构 & 学习期体检 (文档 SOP: 结构减法 + 学习期稳定; 外部方法论非铁律) ──
+    struct, learning = compute_account_structure(all_top_ads)
+    doc.add_heading('🏗️ 账户结构 & 学习期体检', level=2)
+    doc.add_paragraph('依据：转化优化 Ad Set 每周需 ~50 优化事件才退出学习期；账户切太碎→事件分散→学不满。'
+                      '（外部方法论 + Meta 官方常识，非铁律）')
+    for s in struct:
+        frag = '；'.join(f'{c[:20]}({n}个AdSet)' for c, n in s['fragmented']) or '无偏碎'
+        p = doc.add_paragraph(style='List Bullet')
+        p.add_run(f'[{s["account"]}] ').bold = True
+        p.add_run(f'{s["campaigns"]} 个 Campaign | 偏碎(AdSet>2): {frag}')
+    not_grad = [x for x in learning if not x['graduated'] and x['spend'] > 0]
+    doc.add_paragraph(f'学习期：共 {len(learning)} 个活跃 Ad Set，{len(not_grad)} 个本周 purchase <50（未毕业）。')
+    for x in sorted(not_grad, key=lambda x: -x['spend'])[:10]:
+        p = doc.add_paragraph(style='List Bullet')
+        p.add_run(f'🔴 [{x["account"]}] {x["campaign"][:18]} / {x["adset"][:18]} — ').bold = True
+        p.add_run(f'周purchase {x["purchases"]} | Spend ${x["spend"]}')
+    doc.add_paragraph('⚠️ 需人工核对（API 拿不到）：预算单次调整 >20%（扩量期>30%）？Pixel/CAPI 正常？落地页承接？')
 
     # ── Action items ──
     actions = sections.get('下周行动项', '').strip()
