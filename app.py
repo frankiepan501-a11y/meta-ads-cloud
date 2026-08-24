@@ -10,6 +10,7 @@ import os, sys, traceback, threading, time
 from fastapi import FastAPI, HTTPException, Header
 
 import cloud_config  # validates required env vars on import
+from model_guard import META_ADS_MODEL_GUARD
 
 app = FastAPI(title='meta-ads-cloud', version='1.0')
 
@@ -36,7 +37,12 @@ def _spawn(target_name: str, fn, *args, **kwargs):
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'ts': time.time()}
+    return {
+        'ok': True,
+        'ts': time.time(),
+        'model_configured': bool(cloud_config.META_ADS_DEEPSEEK_API_KEY),
+        'model_guard': META_ADS_MODEL_GUARD.snapshot(),
+    }
 
 
 @app.post('/run/s1')

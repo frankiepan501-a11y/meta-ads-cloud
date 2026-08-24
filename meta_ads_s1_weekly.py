@@ -9,10 +9,12 @@ except Exception:
     pass
 
 from cloud_config import (
-    PROXY, IM_APP_ID, IM_APP_SECRET, DEEPSEEK_KEY,
+    PROXY, IM_APP_ID, IM_APP_SECRET, META_ADS_DEEPSEEK_API_KEY,
     PK_TOKEN, FL_TOKEN, PK_ACCOUNT, FL_ACCOUNT,
     WIKI_SPACE_ID, BOSS_OPEN_ID, SKIP_ADLIB_IMAGES,
 )
+from model_guard import META_ADS_MODEL_GUARD
+from model_fallbacks import s1_fallback
 WIKI_PARENT_NODE = os.environ.get('WIKI_PARENT_NODE_S1', 'DLlkwhBymiHJfjk5mC6cuqNnnDy')
 
 LOG_FILE = os.environ.get('S1_LOG_FILE', '/tmp/s1_log.txt')
@@ -105,6 +107,11 @@ def fb_api(path, token):
     return {'error': {'message': f'network error after 3 retries: {last_err}'}}
 
 def deepseek(system_prompt, user_prompt):
+    if not META_ADS_DEEPSEEK_API_KEY:
+        raise RuntimeError('META_ADS_DEEPSEEK_API_KEY is not configured')
+    allowed, reason = META_ADS_MODEL_GUARD.reserve()
+    if not allowed:
+        raise RuntimeError(f'Meta Ads model call blocked: {reason}')
     body = json.dumps({
         'model': 'deepseek-chat', 'max_tokens': 6000,
         'messages': [
@@ -113,9 +120,17 @@ def deepseek(system_prompt, user_prompt):
         ]
     }).encode('utf-8')
     req = urllib.request.Request('https://api.deepseek.com/chat/completions',
-        data=body, headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {DEEPSEEK_KEY}'})
-    resp = json.loads(urllib.request.build_opener(PROXY).open(req, timeout=120).read())
-    return resp['choices'][0]['message']['content']
+        data=body, headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {META_ADS_DEEPSEEK_API_KEY}'})
+    try:
+        resp = json.loads(urllib.request.build_opener(PROXY).open(req, timeout=120).read())
+        content = resp['choices'][0]['message']['content']
+        if not content:
+            raise RuntimeError('DeepSeek returned empty content')
+        META_ADS_MODEL_GUARD.record_success()
+        return content
+    except Exception:
+        META_ADS_MODEL_GUARD.record_failure()
+        raise
 
 def download_image(url):
     """Download image from URL, return bytes or None."""
@@ -949,7 +964,7 @@ Funlab: Spend ${fl_total["spend"]:.2f} ({wow_fl_spend}) | ROAS {fl_total["roas"]
         log(f'  AI: {len(ai_text)} chars')
     except Exception as e:
         log(f'  DeepSeek failed: {e}')
-        ai_text = f'分析失败: {e}'
+        ai_text = s1_fallback(type(e).__name__)
 
     # Parse sections
     sections = {}

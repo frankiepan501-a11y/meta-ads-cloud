@@ -17,8 +17,17 @@ All endpoints require header `x-api-key: <API_KEY>`.
 API_KEY
 IM_APP_ID, IM_APP_SECRET
 BT_APP_ID, BT_APP_SECRET
-DEEPSEEK_KEY
 PK_TOKEN, FL_TOKEN
+```
+
+## Optional AI mode
+
+The service starts safely without these variables and uses deterministic templates. Before enabling the model, configure a durable shared budget that survives container restarts.
+
+```
+META_ADS_DEEPSEEK_API_KEY
+META_ADS_MODEL_DAILY_LIMIT=12
+META_ADS_MODEL_FAILURE_THRESHOLD=2
 ```
 
 ## v1 vs v2

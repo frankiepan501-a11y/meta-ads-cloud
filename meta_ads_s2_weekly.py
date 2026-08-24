@@ -11,9 +11,11 @@ from fb_ad_library_scraper import scrape_ad_library
 
 from cloud_config import (
     PROXY, IM_APP_ID, IM_APP_SECRET, BT_APP_ID, BT_APP_SECRET,
-    DEEPSEEK_KEY, WIKI_SPACE_ID, BOSS_OPEN_ID, SKIP_ADLIB_IMAGES,
+    META_ADS_DEEPSEEK_API_KEY, WIKI_SPACE_ID, BOSS_OPEN_ID, SKIP_ADLIB_IMAGES,
     META_ADS_CONSOLE_APP,
 )
+from model_guard import META_ADS_MODEL_GUARD
+from model_fallbacks import s2_fallback, s2_threat_level
 
 S2_APP_TOKEN = META_ADS_CONSOLE_APP
 S2_TABLE_COMP = 'tblBniOwJYFYMDbQ'
@@ -96,6 +98,11 @@ def feishu(method, path, body=None, app='bt'):
     return {'code': -1, 'body': f'Network error after 3 retries: {last_err}'}
 
 def deepseek(system_prompt, user_prompt):
+    if not META_ADS_DEEPSEEK_API_KEY:
+        raise RuntimeError('META_ADS_DEEPSEEK_API_KEY is not configured')
+    allowed, reason = META_ADS_MODEL_GUARD.reserve()
+    if not allowed:
+        raise RuntimeError(f'Meta Ads model call blocked: {reason}')
     body = json.dumps({
         'model': 'deepseek-chat', 'max_tokens': 6000,
         'messages': [
@@ -104,9 +111,17 @@ def deepseek(system_prompt, user_prompt):
         ]
     }).encode('utf-8')
     req = urllib.request.Request('https://api.deepseek.com/chat/completions',
-        data=body, headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {DEEPSEEK_KEY}'})
-    resp = json.loads(urllib.request.build_opener(PROXY).open(req, timeout=120).read())
-    return resp['choices'][0]['message']['content']
+        data=body, headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {META_ADS_DEEPSEEK_API_KEY}'})
+    try:
+        resp = json.loads(urllib.request.build_opener(PROXY).open(req, timeout=120).read())
+        content = resp['choices'][0]['message']['content']
+        if not content:
+            raise RuntimeError('DeepSeek returned empty content')
+        META_ADS_MODEL_GUARD.record_success()
+        return content
+    except Exception:
+        META_ADS_MODEL_GUARD.record_failure()
+        raise
 
 
 # ============================================================
@@ -772,10 +787,12 @@ def main():
 
         try:
             ai_text = deepseek(sys_prompt, usr_prompt)
+            model_mode = 'deepseek'
             log(f'  AI: {len(ai_text)} chars')
         except Exception as e:
             log(f'  DeepSeek failed: {e}')
-            ai_text = f'分析失败: {e}'
+            ai_text = s2_fallback(type(e).__name__)
+            model_mode = 'template'
 
         per_ad, overall = parse_per_ad_analysis(ai_text)
         log(f'  Parsed: {len(per_ad)} ads, {len(overall)} sections')
@@ -832,12 +849,8 @@ def main():
                 {'fields': fields})
 
         # 2f. Write weekly summary to bitable
-        threat = '低'
-        t_text = overall.get('威胁评估', '')
-        if '高' in t_text:
-            threat = '高'
-        elif '中' in t_text:
-            threat = '中'
+        threat = s2_threat_level(overall.get('威胁评估', ''), model_mode)
+        threat_display = threat or '待人工核对（零模型模板）'
 
         weekly = {
             '周次': week_str,
@@ -853,9 +866,10 @@ def main():
             {'fields': weekly})
         if r.get('code') == 0:
             rid = r['data']['record']['record_id']
-            feishu('PUT',
-                f'/bitable/v1/apps/{S2_APP_TOKEN}/tables/{S2_TABLE_WEEKLY}/records/{rid}',
-                {'fields': {'威胁评估': threat}})
+            if threat:
+                feishu('PUT',
+                    f'/bitable/v1/apps/{S2_APP_TOKEN}/tables/{S2_TABLE_WEEKLY}/records/{rid}',
+                    {'fields': {'威胁评估': threat}})
 
         # Update competitor record
         feishu('PUT',
@@ -871,12 +885,12 @@ def main():
             'new_count': len(new_ids),
             'stopped_count': len(stopped_ids),
             'continuing_count': len(continuing_ids),
-            'threat': threat,
+            'threat': threat_display,
             'per_ad': per_ad,
             'overall': overall,
             'ai_text': ai_text,
         })
-        log(f'  Done: {len(official)} ads (new:{len(new_ids)} stop:{len(stopped_ids)}) threat={threat}')
+        log(f'  Done: {len(official)} ads (new:{len(new_ids)} stop:{len(stopped_ids)}) threat={threat_display}')
 
     # ── Step 5: Build .docx with images and import ──────────
     if not all_reports:

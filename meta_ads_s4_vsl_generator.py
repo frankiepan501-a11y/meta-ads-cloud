@@ -3,7 +3,7 @@ Input: product name + key features
 Process: pull S1/S2/素材库 context → DeepSeek generates 12 angle VSL scripts (Meta Creative Diversification)
 Output: python-docx → import to Feishu wiki → notify
 """
-import json, urllib.request, sys, time, re, datetime, uuid, os, io
+import json, urllib.request, urllib.error, sys, time, re, datetime, uuid, os, io
 try:
     sys.stdout.reconfigure(encoding='utf-8')
 except Exception:
@@ -11,8 +11,10 @@ except Exception:
 
 from cloud_config import (
     PROXY, IM_APP_ID, IM_APP_SECRET, BT_APP_ID, BT_APP_SECRET,
-    DEEPSEEK_KEY, WIKI_SPACE_ID, BOSS_OPEN_ID, META_ADS_CONSOLE_APP,
+    META_ADS_DEEPSEEK_API_KEY, WIKI_SPACE_ID, BOSS_OPEN_ID, META_ADS_CONSOLE_APP,
 )
+from model_guard import META_ADS_MODEL_GUARD
+from model_fallbacks import s4_fallback
 
 MATERIAL_APP = os.environ.get('MATERIAL_APP', 'PpZIbSIuxaPa5wsNGDZcZm9Wn7t')
 S2_APP = META_ADS_CONSOLE_APP
@@ -61,6 +63,8 @@ def feishu(method, path, body=None, app='bt'):
     return {'code': -1, 'body': f'Network error after 3 retries: {last_err}'}
 
 def deepseek(system_prompt, user_prompt):
+    if not META_ADS_DEEPSEEK_API_KEY:
+        raise RuntimeError('META_ADS_DEEPSEEK_API_KEY is not configured')
     body = json.dumps({
         'model': 'deepseek-chat', 'max_tokens': 8000,
         'messages': [
@@ -70,13 +74,28 @@ def deepseek(system_prompt, user_prompt):
     }).encode('utf-8')
     last_err = None
     for attempt in range(3):
+        allowed, reason = META_ADS_MODEL_GUARD.reserve()
+        if not allowed:
+            raise RuntimeError(f'Meta Ads model call blocked: {reason}')
         req = urllib.request.Request('https://api.deepseek.com/chat/completions',
-            data=body, headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {DEEPSEEK_KEY}'})
+            data=body, headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {META_ADS_DEEPSEEK_API_KEY}'})
         try:
             resp = json.loads(urllib.request.build_opener(PROXY).open(req, timeout=180).read())
-            return resp['choices'][0]['message']['content']
+            content = resp['choices'][0]['message']['content']
+            if not content:
+                raise RuntimeError('DeepSeek returned empty content')
+            META_ADS_MODEL_GUARD.record_success()
+            return content
+        except urllib.error.HTTPError as e:
+            last_err = e
+            META_ADS_MODEL_GUARD.record_failure()
+            if e.code in (400, 401, 402, 403):
+                raise
+            log(f'  DeepSeek retry {attempt+1}/3 after HTTP {e.code}')
+            time.sleep(5 * (attempt + 1))
         except Exception as e:
             last_err = e
+            META_ADS_MODEL_GUARD.record_failure()
             log(f'  DeepSeek retry {attempt+1}/3: {e}')
             time.sleep(5 * (attempt + 1))
     raise last_err
@@ -625,12 +644,14 @@ def main(product=None, features=None):
 8. 结合素材库已有的痛点和评论，但也要提出新角度
 '''
 
+    model_mode = 'deepseek'
     try:
         ai_text = deepseek(system_prompt, user_prompt)
         log(f'  AI: {len(ai_text)} chars')
     except Exception as e:
         log(f'  DeepSeek failed: {e}')
-        return
+        model_mode = 'template'
+        ai_text = s4_fallback(product, features, type(e).__name__)
 
     # ── Step 4: Build markdown report ─────────────────────────
     # (markdown import only — cloud docx import systematically gets status=2;
@@ -658,7 +679,7 @@ def main(product=None, features=None):
         },
         'elements': [
             {'tag': 'div', 'text': {'tag': 'lark_md',
-                'content': f'**产品:** {product}\n**卖点:** {features}\n**角度:** 6个VSL脚本已生成'}},
+                'content': f'**产品:** {product}\n**卖点:** {features}\n**模式:** {model_mode}\n**输出:** VSL脚本框架已生成'}},
             {'tag': 'hr'},
             {'tag': 'action', 'actions': [{
                 'tag': 'button',
@@ -674,7 +695,7 @@ def main(product=None, features=None):
 
     # ── Step 7: Parse scripts into JSON and split into material libraries ──
     log('Step 7: Parsing scripts into structured data...')
-    total_records = split_scripts_to_bitable(ai_text, product, now)
+    total_records = split_scripts_to_bitable(ai_text, product, now) if model_mode == 'deepseek' else 0
     log(f'  Total records created: {total_records}')
 
     log(f'\nS4 Complete! {wiki_url}')

@@ -30,8 +30,9 @@ IM_APP_SECRET = _required('IM_APP_SECRET')
 BT_APP_ID = _required('BT_APP_ID')
 BT_APP_SECRET = _required('BT_APP_SECRET')
 
-# AI
-DEEPSEEK_KEY = _required('DEEPSEEK_KEY')
+# AI. No legacy/shared-key fallback: a missing dedicated key keeps model work disabled
+# while console polling and deterministic data collection remain available.
+META_ADS_DEEPSEEK_API_KEY = (os.environ.get('META_ADS_DEEPSEEK_API_KEY') or '').strip()
 
 # Facebook Ads
 PK_TOKEN = _required('PK_TOKEN')
